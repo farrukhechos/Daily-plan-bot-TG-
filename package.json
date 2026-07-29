@@ -1,0 +1,14 @@
+{
+  "name": "daily-plan-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot - foydalanuvchilar kunlik reja yozadi va bajarganini belgilaydi, admin barchasini kuzatadi",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3"
+  }
+}
