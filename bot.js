@@ -1,4 +1,6 @@
 require('dotenv').config();
+const path = require('path');
+const cron = require('node-cron');
 const { Telegraf, Markup } = require('telegraf');
 const db = require('./db');
 
@@ -9,20 +11,23 @@ if (!BOT_TOKEN) {
 }
 
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map(Number);
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(Number);
 
 const bot = new Telegraf(BOT_TOKEN);
+
+// Har bir foydalanuvchining "hozir nima kutayapman" holati (xotirada, RAMda)
+// masalan: { action: 'add' } yoki { action: 'edit', taskId: 12 }
+const pendingAction = new Map();
 
 function isAdmin(ctx) {
   return ADMIN_IDS.includes(ctx.from.id);
 }
 
 function todayStr() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
 function formatDate(dateStr) {
@@ -30,98 +35,281 @@ function formatDate(dateStr) {
   return `${d}.${m}.${y}`;
 }
 
-function planKeyboard(tasks) {
-  const rows = tasks.map((t) => [
-    Markup.button.callback(
-      `${t.is_done ? '✅' : '⬜'} ${t.text}`,
-      `toggle_${t.id}`
-    ),
-  ]);
-  return Markup.inlineKeyboard(rows);
+// Matnni vazifalarga bo'lish: qator ham, vergul ham ajratuvchi hisoblanadi
+function splitIntoTasks(text) {
+  return text
+      .split('\n')
+      .flatMap((line) => line.split(','))
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
 }
+
+const REMINDER_OPTIONS = [
+  { label: '15 daqiqa', minutes: 15 },
+  { label: '30 daqiqa', minutes: 30 },
+  { label: '1 soat', minutes: 60 },
+  { label: '2 soat', minutes: 120 },
+  { label: '3 soat', minutes: 180 },
+  { label: "O'chirish", minutes: 0 },
+];
+
+// ---------- Asosiy menyu (pastdagi doimiy tugmalar) ----------
+
+function mainMenuKeyboard() {
+  return Markup.keyboard([
+    ['📋 Rejalarim'],
+    ['🔔 Bildirishnoma sozlamalari'],
+  ]).resize();
+}
+
+// ---------- Bugungi reja: boshqaruv ekrani ----------
 
 function planText(dateStr, tasks) {
   const done = tasks.filter((t) => t.is_done).length;
-  return `🗓 ${formatDate(dateStr)} kunlik reja\n` +
-    `Bajarildi: ${done}/${tasks.length}\n\n` +
-    `Vazifani bajargan bo'lsangiz, tugmani bosing 👇`;
+  if (tasks.length === 0) {
+    return `🗓 ${formatDate(dateStr)}\n\nHali vazifa qo'shilmagan.\nQuyidagi "➕ Yangi vazifa qo'shish" tugmasini bosing yoki shunchaki yozib yuboring.`;
+  }
+  return `🗓 ${formatDate(dateStr)} kunlik reja\nBajarildi: ${done}/${tasks.length}`;
 }
 
-// ---------- Foydalanuvchi buyruqlari ----------
+function planManageKeyboard(tasks, { editable = true } = {}) {
+  const rows = [];
+  tasks.forEach((t) => {
+    rows.push([
+      Markup.button.callback(`${t.is_done ? '✅' : '⬜'} ${t.text}`, `toggle_${t.id}`),
+    ]);
+    if (editable) {
+      rows.push([
+        Markup.button.callback('✏️ Tahrirlash', `edit_${t.id}`),
+        Markup.button.callback("🗑 O'chirish", `delete_${t.id}`),
+      ]);
+    }
+  });
+  if (editable) {
+    rows.push([Markup.button.callback('➕ Yangi vazifa qo\'shish', 'add_task')]);
+    rows.push([Markup.button.callback("🕘 Oldingi rejalarim", 'history_0')]);
+  } else {
+    rows.push([Markup.button.callback('⬅️ Ortga', 'history_0')]);
+  }
+  return Markup.inlineKeyboard(rows);
+}
+
+async function showTodayPlan(ctx, { edit = false } = {}) {
+  const user = db.getOrCreateUser(ctx.from);
+  const date = todayStr();
+  const plan = db.getOrCreatePlan(user.id, date);
+  const tasks = db.getPlanTasks(plan.id);
+  const text = planText(date, tasks);
+  const kb = planManageKeyboard(tasks, { editable: true });
+  if (edit) {
+    try {
+      await ctx.editMessageText(text, kb);
+      return;
+    } catch (e) {
+      // xabarni tahrirlab bo'lmasa, yangisini yuboramiz
+    }
+  }
+  await ctx.reply(text, kb);
+}
+
+// ---------- Bot buyruqlari ----------
 
 bot.start(async (ctx) => {
   db.getOrCreateUser(ctx.from);
   await ctx.reply(
-    `Assalomu alaykum, ${ctx.from.first_name || 'do\'stim'}! 👋\n\n` +
-    `Bu bot orqali kunlik rejangizni yozib, bajarganingizni belgilab borishingiz mumkin.\n\n` +
-    `📌 Qanday ishlaydi:\n` +
-    `1. Menga bugungi rejangizni yozing, har bir vazifani yangi qatordan yozing. Masalan:\n\n` +
-    `Ertalab yugurish\nKitob o'qish\nIngliz tili darsi\n\n` +
-    `2. Men har bir vazifa uchun tugma bilan ro'yxat chiqarib beraman.\n` +
-    `3. Vazifani bajarsangiz, shu tugmani bosing — u ✅ bo'lib qoladi.\n\n` +
-    `Buyruqlar:\n` +
-    `/reja — bugungi rejangizni qayta ko'rish`
+      `Assalomu alaykum, ${ctx.from.first_name || "do'stim"}! 👋\n\n` +
+      `Bu bot orqali kunlik rejangizni yozib, bajarganingizni belgilab borishingiz mumkin.\n\n` +
+      `📌 Qanday ishlaydi:\n` +
+      `• Vazifangizni yozib yuboring — har birini alohida qatorga yoki vergul bilan ajratib yozsangiz, har biri alohida vazifa bo'lib qo'shiladi.\n` +
+      `• Har bir vazifani ✅ belgilash, ✏️ tahrirlash yoki 🗑 o'chirish mumkin.\n` +
+      `• Bajarilmagan vazifalaringiz haqida siz belgilagan vaqt oralig'ida eslatma keladi.\n\n` +
+      `Pastdagi menyudan foydalaning 👇`,
+      mainMenuKeyboard()
   );
+});
+
+bot.hears('📋 Rejalarim', async (ctx) => {
+  pendingAction.delete(ctx.from.id);
+  await showTodayPlan(ctx);
 });
 
 bot.command('reja', async (ctx) => {
-  const user = db.getOrCreateUser(ctx.from);
-  const date = todayStr();
-  const detail = db.getUserPlanDetail(user.id, date);
-  if (!detail || detail.tasks.length === 0) {
-    return ctx.reply(
-      "Bugun uchun hali reja kiritmagansiz.\nVazifalaringizni har birini yangi qatordan yozib yuboring."
-    );
-  }
-  await ctx.reply(planText(date, detail.tasks), planKeyboard(detail.tasks));
+  pendingAction.delete(ctx.from.id);
+  await showTodayPlan(ctx);
 });
 
-// Oddiy matn xabar = yangi kunlik reja
-bot.on('text', async (ctx, next) => {
-  const text = ctx.message.text.trim();
-  if (text.startsWith('/')) return next(); // buyruqlarni o'tkazib yuboramiz
-
+bot.hears('🔔 Bildirishnoma sozlamalari', async (ctx) => {
   const user = db.getOrCreateUser(ctx.from);
-  const date = todayStr();
-
-  const lines = text
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-
-  if (lines.length === 0) {
-    return ctx.reply('Iltimos, kamida bitta vazifa yozing.');
-  }
-
-  const plan = db.getOrCreatePlan(user.id, date);
-  lines.forEach((line) => db.addTask(plan.id, line));
-
-  const tasks = db.getPlanTasks(plan.id);
+  const current = user.reminder_interval_minutes;
+  const rows = REMINDER_OPTIONS.map((o) => [
+    Markup.button.callback(
+        `${o.minutes === current ? '✅ ' : ''}${o.label}`,
+        `rem_${o.minutes}`
+    ),
+  ]);
   await ctx.reply(
-    `Reja saqlandi ✅ (${lines.length} ta yangi vazifa qo'shildi)\n\n` + planText(date, tasks),
-    planKeyboard(tasks)
+      `🔔 Bildirishnoma sozlamalari\n\nBajarilmagan vazifalaringiz bo'lsa, tanlangan vaqt oralig'ida sizga eslatma yuboraman.\n\nHozirgi sozlama: ${
+          current > 0 ? current + ' daqiqada bir marta' : "o'chirilgan"
+      }`,
+      Markup.inlineKeyboard(rows)
   );
 });
 
-// Checkbox bosilganda
+// ---------- Callback tugmalar ----------
+
+bot.action(/^rem_(\d+)$/, async (ctx) => {
+  const minutes = Number(ctx.match[1]);
+  const user = db.getOrCreateUser(ctx.from);
+  db.setReminderInterval(user.id, minutes);
+  const rows = REMINDER_OPTIONS.map((o) => [
+    Markup.button.callback(`${o.minutes === minutes ? '✅ ' : ''}${o.label}`, `rem_${o.minutes}`),
+  ]);
+  await ctx.editMessageText(
+      `🔔 Bildirishnoma sozlamalari\n\nHozirgi sozlama: ${
+          minutes > 0 ? minutes + ' daqiqada bir marta' : "o'chirilgan"
+      }`,
+      Markup.inlineKeyboard(rows)
+  );
+  await ctx.answerCbQuery("Saqlandi ✅");
+});
+
+bot.action('add_task', async (ctx) => {
+  pendingAction.set(ctx.from.id, { action: 'add' });
+  await ctx.answerCbQuery();
+  await ctx.reply(
+      "Yangi vazifa(lar)ni yozing. Bir nechtasini vergul yoki alohida qator bilan ajratib yuborsangiz, har biri alohida vazifa bo'lib qo'shiladi."
+  );
+});
+
 bot.action(/^toggle_(\d+)$/, async (ctx) => {
   const taskId = Number(ctx.match[1]);
   const task = db.getTask(taskId);
-  if (!task) {
-    return ctx.answerCbQuery('Vazifa topilmadi.');
-  }
+  if (!task) return ctx.answerCbQuery('Vazifa topilmadi.');
   const plan = db.getPlanById(task.plan_id);
   const user = db.getUserById(plan.user_id);
-
-  // Faqat vazifa egasi o'zgartira oladi
-  if (user.telegram_id !== ctx.from.id) {
-    return ctx.answerCbQuery('Bu sizning vazifangiz emas.');
-  }
+  if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning vazifangiz emas.');
 
   const updated = db.toggleTask(taskId);
-  const tasks = db.getPlanTasks(plan.id);
-  await ctx.editMessageText(planText(plan.plan_date, tasks), planKeyboard(tasks));
+  await showTodayPlan(ctx, { edit: true });
   await ctx.answerCbQuery(updated.is_done ? 'Bajarildi ✅' : 'Bekor qilindi');
+});
+
+bot.action(/^edit_(\d+)$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const task = db.getTask(taskId);
+  if (!task) return ctx.answerCbQuery('Vazifa topilmadi.');
+  const plan = db.getPlanById(task.plan_id);
+  const user = db.getUserById(plan.user_id);
+  if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning vazifangiz emas.');
+
+  pendingAction.set(ctx.from.id, { action: 'edit', taskId });
+  await ctx.answerCbQuery();
+  await ctx.reply(`Vazifa uchun yangi matnni yozing:\n\nEski matn: "${task.text}"`);
+});
+
+bot.action(/^delete_(\d+)$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const task = db.getTask(taskId);
+  if (!task) return ctx.answerCbQuery('Vazifa topilmadi.');
+  const plan = db.getPlanById(task.plan_id);
+  const user = db.getUserById(plan.user_id);
+  if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning vazifangiz emas.');
+
+  db.deleteTask(taskId);
+  await showTodayPlan(ctx, { edit: true });
+  await ctx.answerCbQuery("O'chirildi 🗑");
+});
+
+// ---------- Oldingi rejalar tarixi ----------
+
+const HISTORY_PAGE_SIZE = 6;
+
+bot.action(/^history_(\d+)$/, async (ctx) => {
+  const page = Number(ctx.match[1]);
+  const user = db.getOrCreateUser(ctx.from);
+  const allPlans = db.getUserPlans(user.id);
+  const start = page * HISTORY_PAGE_SIZE;
+  const pagePlans = allPlans.slice(start, start + HISTORY_PAGE_SIZE);
+
+  const rows = pagePlans.map((p) => {
+    const tasks = db.getPlanTasks(p.id);
+    const done = tasks.filter((t) => t.is_done).length;
+    return [Markup.button.callback(
+        `${formatDate(p.plan_date)} — ${done}/${tasks.length}`,
+        `histday_${p.plan_date}`
+    )];
+  });
+
+  const navRow = [];
+  if (page > 0) navRow.push(Markup.button.callback('⬅️ Oldingi', `history_${page - 1}`));
+  if (start + HISTORY_PAGE_SIZE < allPlans.length) navRow.push(Markup.button.callback('Keyingi ➡️', `history_${page + 1}`));
+  if (navRow.length) rows.push(navRow);
+  rows.push([Markup.button.callback("⬅️ Bugungi rejaga qaytish", 'back_today')]);
+
+  const text = allPlans.length === 0
+      ? "Hali hech qanday reja tarixi yo'q."
+      : `🕘 Oldingi rejalaringiz (${allPlans.length} kun)\nKerakli kunni tanlang:`;
+
+  try {
+    await ctx.editMessageText(text, Markup.inlineKeyboard(rows));
+  } catch (e) {
+    await ctx.reply(text, Markup.inlineKeyboard(rows));
+  }
+  await ctx.answerCbQuery();
+});
+
+bot.action(/^histday_(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
+  const dateStr = ctx.match[1];
+  const user = db.getOrCreateUser(ctx.from);
+  const detail = db.getUserPlanDetail(user.id, dateStr);
+  if (!detail) return ctx.answerCbQuery('Topilmadi');
+
+  const isToday = dateStr === todayStr();
+  const text = `🗓 ${formatDate(dateStr)}\nBajarildi: ${detail.done}/${detail.total}` +
+      (isToday ? '' : '\n\n(bu — o\'tgan kun, faqat ko\'rish uchun)');
+
+  await ctx.editMessageText(text, planManageKeyboard(detail.tasks, { editable: isToday }));
+  await ctx.answerCbQuery();
+});
+
+bot.action('back_today', async (ctx) => {
+  await showTodayPlan(ctx, { edit: true });
+  await ctx.answerCbQuery();
+});
+
+// ---------- Matnli xabarlarni qayta ishlash ----------
+
+bot.on('text', async (ctx, next) => {
+  const raw = ctx.message.text;
+  if (raw.startsWith('/')) return next();
+  if (raw === '📋 Rejalarim' || raw === '🔔 Bildirishnoma sozlamalari') return next();
+
+  const user = db.getOrCreateUser(ctx.from);
+  const state = pendingAction.get(ctx.from.id);
+
+  // Tahrirlash rejimida bo'lsa
+  if (state && state.action === 'edit') {
+    const newText = raw.trim();
+    if (!newText) return ctx.reply("Matn bo'sh bo'lmasligi kerak.");
+    db.updateTaskText(state.taskId, newText);
+    pendingAction.delete(ctx.from.id);
+    await ctx.reply('Vazifa yangilandi ✅');
+    return showTodayPlan(ctx);
+  }
+
+  // Aks holda — yangi vazifa(lar) qo'shish (oddiy yozish yoki "➕" tugmasidan keyin ham shu yerga tushadi)
+  pendingAction.delete(ctx.from.id);
+  const items = splitIntoTasks(raw);
+  if (items.length === 0) {
+    return ctx.reply('Iltimos, kamida bitta vazifa yozing.');
+  }
+
+  const date = todayStr();
+  const plan = db.getOrCreatePlan(user.id, date);
+  items.forEach((text) => db.addTask(plan.id, text));
+
+  await ctx.reply(`Qo'shildi ✅ (${items.length} ta yangi vazifa)`);
+  await showTodayPlan(ctx);
 });
 
 // ---------- Admin qismi ----------
@@ -138,11 +326,11 @@ bot.command('admin', async (ctx) => {
   if (!adminGuard(ctx)) return;
   const count = db.getUsersCount();
   await ctx.reply(
-    `🔐 Admin panel\n\nJami foydalanuvchilar: ${count}`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('👥 Foydalanuvchilar ro\'yxati', 'admin_users_0')],
-      [Markup.button.callback('📊 Bugungi statistika', 'admin_stats_today')],
-    ])
+      `🔐 Admin panel\n\nJami foydalanuvchilar: ${count}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("👥 Foydalanuvchilar ro'yxati", 'admin_users_0')],
+        [Markup.button.callback('📊 Bugungi statistika', 'admin_stats_today')],
+      ])
   );
 });
 
@@ -183,18 +371,18 @@ async function sendTodayStats(ctx) {
 }
 
 bot.action('admin_stats_today', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Ruxsat yo\'q');
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Ruxsat yo'q");
   await sendTodayStats(ctx);
 });
 
-const PAGE_SIZE = 8;
+const ADMIN_PAGE_SIZE = 8;
 
 bot.action(/^admin_users_(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Ruxsat yo\'q');
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Ruxsat yo'q");
   const page = Number(ctx.match[1]);
   const all = db.getAllUsers();
-  const start = page * PAGE_SIZE;
-  const pageUsers = all.slice(start, start + PAGE_SIZE);
+  const start = page * ADMIN_PAGE_SIZE;
+  const pageUsers = all.slice(start, start + ADMIN_PAGE_SIZE);
 
   const rows = pageUsers.map((u) => {
     const label = u.username ? `@${u.username}` : (u.first_name || `ID:${u.telegram_id}`);
@@ -203,7 +391,7 @@ bot.action(/^admin_users_(\d+)$/, async (ctx) => {
 
   const navRow = [];
   if (page > 0) navRow.push(Markup.button.callback('⬅️ Oldingi', `admin_users_${page - 1}`));
-  if (start + PAGE_SIZE < all.length) navRow.push(Markup.button.callback('Keyingi ➡️', `admin_users_${page + 1}`));
+  if (start + ADMIN_PAGE_SIZE < all.length) navRow.push(Markup.button.callback('Keyingi ➡️', `admin_users_${page + 1}`));
   if (navRow.length) rows.push(navRow);
 
   const text = `👥 Foydalanuvchilar (${all.length} ta)\nKerakli foydalanuvchini tanlang:`;
@@ -216,7 +404,7 @@ bot.action(/^admin_users_(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^admin_user_(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Ruxsat yo\'q');
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Ruxsat yo'q");
   const userId = Number(ctx.match[1]);
   const user = db.getUserById(userId);
   if (!user) return ctx.answerCbQuery('Topilmadi');
@@ -226,8 +414,8 @@ bot.action(/^admin_user_(\d+)$/, async (ctx) => {
 
   if (plans.length === 0) {
     await ctx.editMessageText(
-      `👤 ${name}\nRo'yxatdan o'tgan, lekin hali reja kiritmagan.`,
-      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Ortga', 'admin_users_0')]])
+        `👤 ${name}\nRo'yxatdan o'tgan, lekin hali reja kiritmagan.`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Ortga', 'admin_users_0')]])
     );
     return ctx.answerCbQuery();
   }
@@ -236,21 +424,21 @@ bot.action(/^admin_user_(\d+)$/, async (ctx) => {
     const tasks = db.getPlanTasks(p.id);
     const done = tasks.filter((t) => t.is_done).length;
     return [Markup.button.callback(
-      `${formatDate(p.plan_date)} — ${done}/${tasks.length}`,
-      `admin_userplan_${userId}_${p.plan_date}`
+        `${formatDate(p.plan_date)} — ${done}/${tasks.length}`,
+        `admin_userplan_${userId}_${p.plan_date}`
     )];
   });
   rows.push([Markup.button.callback('⬅️ Ortga', 'admin_users_0')]);
 
   await ctx.editMessageText(
-    `👤 ${name}\nJami kunlar: ${plans.length}\nKunni tanlang:`,
-    Markup.inlineKeyboard(rows)
+      `👤 ${name}\nJami kunlar: ${plans.length}\nKunni tanlang:`,
+      Markup.inlineKeyboard(rows)
   );
   await ctx.answerCbQuery();
 });
 
 bot.action(/^admin_userplan_(\d+)_(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Ruxsat yo\'q');
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Ruxsat yo'q");
   const userId = Number(ctx.match[1]);
   const dateStr = ctx.match[2];
   const user = db.getUserById(userId);
@@ -264,10 +452,53 @@ bot.action(/^admin_userplan_(\d+)_(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   });
 
   await ctx.editMessageText(
-    msg,
-    Markup.inlineKeyboard([[Markup.button.callback('⬅️ Ortga', `admin_user_${userId}`)]])
+      msg,
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Ortga', `admin_user_${userId}`)]])
   );
   await ctx.answerCbQuery();
+});
+
+// ---------- Har daqiqada tekshiriladigan avtomatik eslatma ----------
+
+cron.schedule('* * * * *', async () => {
+  const date = todayStr();
+  let dueUsers;
+  try {
+    dueUsers = db.getUsersDueForReminder(date);
+  } catch (e) {
+    console.error('Eslatmalarni tekshirishda xato:', e);
+    return;
+  }
+
+  for (const user of dueUsers) {
+    try {
+      const tasks = db.getPlanTasks(user.plan_id);
+      const undone = tasks.filter((t) => !t.is_done);
+      if (undone.length === 0) continue;
+
+      // eski eslatma xabarini o'chirib tashlaymiz (bo'lsa)
+      if (user.last_reminder_chat_id && user.last_reminder_message_id) {
+        try {
+          await bot.telegram.deleteMessage(user.last_reminder_chat_id, user.last_reminder_message_id);
+        } catch (e) {
+          // eski xabar allaqachon o'chirilgan yoki muddati o'tgan bo'lishi mumkin — o'tkazib yuboramiz
+        }
+      }
+
+      let text = `⏰ Eslatma: bugungi rejangizda hali bajarilmagan vazifalar bor:\n\n`;
+      undone.forEach((t) => { text += `⬜ ${t.text}\n`; });
+
+      const sent = await bot.telegram.sendMessage(
+          user.telegram_id,
+          text,
+          planManageKeyboard(tasks, { editable: true })
+      );
+
+      db.setLastReminder(user.id, user.telegram_id, sent.message_id);
+    } catch (e) {
+      console.error(`Foydalanuvchi ${user.telegram_id} ga eslatma yuborishda xato:`, e.message);
+    }
+  }
 });
 
 bot.launch();
