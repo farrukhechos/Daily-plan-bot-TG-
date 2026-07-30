@@ -41,6 +41,7 @@ bot.use(async (ctx, next) => {
 // Har bir foydalanuvchining "hozir nima kutayapman" holati (xotirada, RAMda)
 // masalan: { action: 'add' } yoki { action: 'edit', taskId: 12 }
 const pendingAction = new Map();
+const adminBroadcast = new Map();
 
 function isAdmin(ctx) {
   return ADMIN_IDS.includes(ctx.from.id);
@@ -301,6 +302,29 @@ bot.action('back_today', async (ctx) => {
 
 bot.on('text', async (ctx, next) => {
   const raw = ctx.message.text;
+  if (adminBroadcast.get(ctx.from.id)) {
+    adminBroadcast.delete(ctx.from.id);
+
+    const users = db.getAllUsers();
+
+    let sent = 0;
+    let failed = 0;
+
+    await ctx.reply(`📨 ${users.length} ta foydalanuvchiga yuborilmoqda...`);
+
+    for (const user of users) {
+      try {
+        await bot.telegram.sendMessage(user.telegram_id, raw);
+        sent++;
+      } catch (e) {
+        failed++;
+      }
+    }
+
+    return ctx.reply(
+        `✅ Tugadi!\n\nYuborildi: ${sent}\nYuborilmadi: ${failed}`
+    );
+  }
   if (raw.startsWith('/')) return next();
   if (raw === '📋 Rejalarim' || raw === '🔔 Bildirishnoma sozlamalari') return next();
 
@@ -342,6 +366,15 @@ function adminGuard(ctx) {
   return true;
 }
 
+bot.command('broadcast', async (ctx) => {
+  if (!adminGuard(ctx)) return;
+
+  adminBroadcast.set(ctx.from.id, true);
+
+  await ctx.reply(
+      "📢 Barcha foydalanuvchilarga yuboriladigan xabarni yozing."
+  );
+});
 bot.command('admin', async (ctx) => {
   if (!adminGuard(ctx)) return;
   const count = db.getUsersCount();
