@@ -302,6 +302,11 @@ bot.action('back_today', async (ctx) => {
 
 bot.on('text', async (ctx, next) => {
   const raw = ctx.message.text;
+  if (raw.length > 1000) {
+    return ctx.reply(
+        "❌ Juda uzun matn yubordingiz. Iltimos 1000 ta belgidan kamroq yuboring."
+    );
+  }
   if (adminBroadcast.get(ctx.from.id)) {
     adminBroadcast.delete(ctx.from.id);
 
