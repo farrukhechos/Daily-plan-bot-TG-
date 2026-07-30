@@ -302,7 +302,7 @@ bot.action('back_today', async (ctx) => {
 
 bot.on('text', async (ctx, next) => {
   const raw = ctx.message.text;
-  if (raw.length > 1000) {
+  if (raw.length > 200) {
     return ctx.reply(
         "❌ Juda uzun matn yubordingiz. Iltimos 1000 ta belgidan kamroq yuboring."
     );
