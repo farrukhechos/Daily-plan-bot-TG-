@@ -14,7 +14,10 @@ db.exec(`
                                      last_reminder_at TEXT,
                                      last_reminder_chat_id INTEGER,
                                      last_reminder_message_id INTEGER,
+                                     is_banned INTEGER DEFAULT 0,
                                      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    
+                                   
   );
 
   CREATE TABLE IF NOT EXISTS plans (
@@ -44,6 +47,8 @@ const migrations = [
   `ALTER TABLE users ADD COLUMN last_reminder_at TEXT`,
   `ALTER TABLE users ADD COLUMN last_reminder_chat_id INTEGER`,
   `ALTER TABLE users ADD COLUMN last_reminder_message_id INTEGER`,
+  `ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0`,
+
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch (e) { /* ustun allaqachon mavjud */ }
@@ -179,6 +184,17 @@ function getUsersDueForReminder(dateStr) {
   `).all(dateStr);
 }
 
+function banUser(userId) {
+  db.prepare(
+      'UPDATE users SET is_banned = 1 WHERE id = ?'
+  ).run(userId);
+}
+
+function unbanUser(userId) {
+  db.prepare(
+      'UPDATE users SET is_banned = 0 WHERE id = ?'
+  ).run(userId);
+}
 module.exports = {
   getOrCreateUser,
   getUserByTelegramId,
@@ -200,4 +216,6 @@ module.exports = {
   getUserPlanDetail,
   getTodayStats,
   getUsersDueForReminder,
+  banUser,
+  unbanUser,
 };

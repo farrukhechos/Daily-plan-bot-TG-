@@ -17,6 +17,26 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
     .map(Number);
 
 const bot = new Telegraf(BOT_TOKEN);
+bot.use(async (ctx, next) => {
+
+  if (!ctx.from) return next();
+
+  const user = db.getUserByTelegramId(ctx.from.id);
+
+  if (user && user.is_banned) {
+
+    try {
+      await ctx.reply(
+          "🚫 Siz administrator tomonidan ushbu botdan bloklandingiz."
+      );
+    } catch {}
+
+    return;
+  }
+
+  return next();
+
+});
 
 // Har bir foydalanuvchining "hozir nima kutayapman" holati (xotirada, RAMda)
 // masalan: { action: 'add' } yoki { action: 'edit', taskId: 12 }
@@ -428,7 +448,16 @@ bot.action(/^admin_user_(\d+)$/, async (ctx) => {
         `admin_userplan_${userId}_${p.plan_date}`
     )];
   });
-  rows.push([Markup.button.callback('⬅️ Ortga', 'admin_users_0')]);
+  rows.push([
+    Markup.button.callback(
+        user.is_banned ? "✅ Ban'dan chiqarish" : "🚫 Ban qilish",
+        user.is_banned ? `unban_${userId}` : `ban_${userId}`
+    )
+  ]);
+
+  rows.push([
+    Markup.button.callback('⬅️ Ortga', 'admin_users_0')
+  ]);
 
   await ctx.editMessageText(
       `👤 ${name}\nJami kunlar: ${plans.length}\nKunni tanlang:`,
@@ -499,6 +528,45 @@ cron.schedule('* * * * *', async () => {
       console.error(`Foydalanuvchi ${user.telegram_id} ga eslatma yuborishda xato:`, e.message);
     }
   }
+});
+bot.action(/^ban_(\d+)$/, async (ctx) => {
+
+  if (!isAdmin(ctx)) return;
+
+  const id = Number(ctx.match[1]);
+
+  const user = db.getUserById(id);
+
+  db.banUser(id);
+
+  try {
+    await bot.telegram.sendMessage(
+        user.telegram_id,
+        "🚫 Siz administrator tomonidan botdan bloklandingiz."
+    );
+  } catch {}
+
+  await ctx.answerCbQuery("Ban qilindi");
+});
+
+bot.action(/^unban_(\d+)$/, async (ctx) => {
+
+  if (!isAdmin(ctx)) return;
+
+  const id = Number(ctx.match[1]);
+
+  const user = db.getUserById(id);
+
+  db.unbanUser(id);
+
+  try {
+    await bot.telegram.sendMessage(
+        user.telegram_id,
+        "✅ Sizning blokingiz olib tashlandi."
+    );
+  } catch {}
+
+  await ctx.answerCbQuery("Ban olib tashlandi");
 });
 
 bot.launch();
