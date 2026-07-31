@@ -37,8 +37,27 @@ db.exec(`
                                      FOREIGN KEY (plan_id) REFERENCES plans(id)
     );
 
+  CREATE TABLE IF NOT EXISTS yearly_plans (
+                                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                     user_id INTEGER NOT NULL,
+                                     year INTEGER NOT NULL,
+                                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                     FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+  CREATE TABLE IF NOT EXISTS yearly_tasks (
+                                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                     yearly_plan_id INTEGER NOT NULL,
+                                     text TEXT NOT NULL,
+                                     is_done INTEGER DEFAULT 0,
+                                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                     FOREIGN KEY (yearly_plan_id) REFERENCES yearly_plans(id)
+    );
+
   CREATE INDEX IF NOT EXISTS idx_plans_user_date ON plans(user_id, plan_date);
   CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);
+  CREATE INDEX IF NOT EXISTS idx_yearly_plans_user_year ON yearly_plans(user_id, year);
+  CREATE INDEX IF NOT EXISTS idx_yearly_tasks_plan ON yearly_tasks(yearly_plan_id);
 `);
 
 // Eski bazalarda bu ustunlar bo'lmasligi mumkin - xato chiqsa e'tiborsiz qoldiramiz
@@ -98,7 +117,7 @@ function touchLastReminderTime(userId) {
   db.prepare('UPDATE users SET last_reminder_at = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
 }
 
-// ---- Plans / Tasks ----
+// ---- Plans / Tasks (kunlik reja) ----
 
 function getOrCreatePlan(userId, dateStr) {
   const existing = db.prepare('SELECT * FROM plans WHERE user_id = ? AND plan_date = ?').get(userId, dateStr);
@@ -169,21 +188,6 @@ function getTodayStats(dateStr) {
   return rows;
 }
 
-// Bildirishnoma yuborish vaqti kelgan foydalanuvchilar (tugallanmagan vazifasi bor va interval o'tgan)
-function getUsersDueForReminder(dateStr) {
-  return db.prepare(`
-    SELECT u.*, p.id as plan_id
-    FROM users u
-           JOIN plans p ON p.user_id = u.id AND p.plan_date = ?
-    WHERE u.reminder_interval_minutes > 0
-      AND EXISTS (SELECT 1 FROM tasks t WHERE t.plan_id = p.id AND t.is_done = 0)
-      AND (
-      u.last_reminder_at IS NULL
-        OR (strftime('%s','now') - strftime('%s', u.last_reminder_at)) >= (u.reminder_interval_minutes * 60)
-      )
-  `).all(dateStr);
-}
-
 function banUser(userId) {
   db.prepare(
       'UPDATE users SET is_banned = 1 WHERE id = ?'
@@ -195,6 +199,84 @@ function unbanUser(userId) {
       'UPDATE users SET is_banned = 0 WHERE id = ?'
   ).run(userId);
 }
+
+// ---- Yearly plans / tasks (yillik reja) ----
+
+function getOrCreateYearlyPlan(userId, year) {
+  const existing = db.prepare('SELECT * FROM yearly_plans WHERE user_id = ? AND year = ?').get(userId, year);
+  if (existing) return existing;
+  const info = db.prepare('INSERT INTO yearly_plans (user_id, year) VALUES (?, ?)').run(userId, year);
+  return db.prepare('SELECT * FROM yearly_plans WHERE id = ?').get(info.lastInsertRowid);
+}
+
+function getYearlyPlanById(id) {
+  return db.prepare('SELECT * FROM yearly_plans WHERE id = ?').get(id);
+}
+
+function addYearlyTask(yearlyPlanId, text) {
+  const info = db.prepare('INSERT INTO yearly_tasks (yearly_plan_id, text) VALUES (?, ?)').run(yearlyPlanId, text);
+  return db.prepare('SELECT * FROM yearly_tasks WHERE id = ?').get(info.lastInsertRowid);
+}
+
+function getYearlyPlanTasks(yearlyPlanId) {
+  return db.prepare('SELECT * FROM yearly_tasks WHERE yearly_plan_id = ? ORDER BY id ASC').all(yearlyPlanId);
+}
+
+function getYearlyTask(id) {
+  return db.prepare('SELECT * FROM yearly_tasks WHERE id = ?').get(id);
+}
+
+function toggleYearlyTask(id) {
+  const task = getYearlyTask(id);
+  if (!task) return null;
+  const newVal = task.is_done ? 0 : 1;
+  db.prepare('UPDATE yearly_tasks SET is_done = ? WHERE id = ?').run(newVal, id);
+  return getYearlyTask(id);
+}
+
+function deleteYearlyTask(id) {
+  return db.prepare('DELETE FROM yearly_tasks WHERE id = ?').run(id);
+}
+
+function updateYearlyTaskText(id, newText) {
+  db.prepare('UPDATE yearly_tasks SET text = ? WHERE id = ?').run(newText, id);
+  return getYearlyTask(id);
+}
+
+function getUserYearlyPlans(userId) {
+  return db.prepare('SELECT * FROM yearly_plans WHERE user_id = ? ORDER BY year DESC').all(userId);
+}
+
+// ---- Statistika / diagrammalar uchun agregatsiya ----
+
+// Berilgan oy (YYYY-MM) ichidagi har bir kun bo'yicha vazifalar soni (kunlik trend diagrammasi uchun)
+function getDailyStatsForMonth(userId, yearMonthPrefix) {
+  return db.prepare(`
+    SELECT p.plan_date as date,
+           COUNT(t.id) as total,
+           SUM(CASE WHEN t.is_done = 1 THEN 1 ELSE 0 END) as done
+    FROM plans p
+           LEFT JOIN tasks t ON t.plan_id = p.id
+    WHERE p.user_id = ? AND substr(p.plan_date, 1, 7) = ?
+    GROUP BY p.plan_date
+    ORDER BY p.plan_date ASC
+  `).all(userId, yearMonthPrefix);
+}
+
+// Berilgan yil ichida har bir oy bo'yicha kunlik vazifalar statistikasi (yillik diagramma uchun)
+function getMonthlyStatsForYear(userId, year) {
+  return db.prepare(`
+    SELECT substr(p.plan_date, 6, 2) as month,
+           COUNT(t.id) as total,
+           SUM(CASE WHEN t.is_done = 1 THEN 1 ELSE 0 END) as done
+    FROM plans p
+           LEFT JOIN tasks t ON t.plan_id = p.id
+    WHERE p.user_id = ? AND substr(p.plan_date, 1, 4) = ?
+    GROUP BY month
+    ORDER BY month ASC
+  `).all(userId, String(year));
+}
+
 module.exports = {
   getOrCreateUser,
   getUserByTelegramId,
@@ -215,7 +297,17 @@ module.exports = {
   getUserPlans,
   getUserPlanDetail,
   getTodayStats,
-  getUsersDueForReminder,
   banUser,
   unbanUser,
+  getOrCreateYearlyPlan,
+  getYearlyPlanById,
+  addYearlyTask,
+  getYearlyPlanTasks,
+  getYearlyTask,
+  toggleYearlyTask,
+  deleteYearlyTask,
+  updateYearlyTaskText,
+  getUserYearlyPlans,
+  getDailyStatsForMonth,
+  getMonthlyStatsForYear,
 };

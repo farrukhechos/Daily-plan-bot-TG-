@@ -1,6 +1,5 @@
 require('dotenv').config();
 const path = require('path');
-const cron = require('node-cron');
 const { Telegraf, Markup } = require('telegraf');
 const db = require('./db');
 
@@ -39,7 +38,7 @@ bot.use(async (ctx, next) => {
 });
 
 // Har bir foydalanuvchining "hozir nima kutayapman" holati (xotirada, RAMda)
-// masalan: { action: 'add' } yoki { action: 'edit', taskId: 12 }
+// masalan: { type: 'daily', action: 'add' } yoki { type: 'yearly', action: 'edit', taskId: 12 }
 const pendingAction = new Map();
 const adminBroadcast = new Map();
 
@@ -49,6 +48,10 @@ function isAdmin(ctx) {
 
 function todayStr() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function currentYear() {
+  return new Date().getFullYear();
 }
 
 function formatDate(dateStr) {
@@ -65,23 +68,33 @@ function splitIntoTasks(text) {
       .filter((t) => t.length > 0);
 }
 
-const REMINDER_OPTIONS = [
-  { label: '15 daqiqa', minutes: 15 },
-  { label: '30 daqiqa', minutes: 30 },
-  { label: '1 soat', minutes: 60 },
-  { label: '2 soat', minutes: 120 },
-  { label: '3 soat', minutes: 180 },
-  { label: "O'chirish", minutes: 0 },
+// ---------- Progress-bar / diagramma yordamchisi ----------
+
+function progressBar(done, total, size = 12) {
+  done = done || 0;
+  total = total || 0;
+  if (total === 0) return `${'░'.repeat(size)} 0%`;
+  const ratio = Math.max(0, Math.min(1, done / total));
+  const filled = Math.round(ratio * size);
+  const pct = Math.round(ratio * 100);
+  return `${'█'.repeat(filled)}${'░'.repeat(size - filled)} ${pct}%`;
+}
+
+const MONTH_NAMES_UZ = [
+  'Yanvar', 'Fevral', 'Mart', 'Aprel', 'May', 'Iyun',
+  'Iyul', 'Avgust', 'Sentabr', 'Oktabr', 'Noyabr', 'Dekabr',
 ];
 
 // ---------- Asosiy menyu (pastdagi doimiy tugmalar) ----------
 
 function mainMenuKeyboard() {
   return Markup.keyboard([
-    ['📋 Rejalarim'],
-    ['🔔 Bildirishnoma sozlamalari'],
+    ['📋 Kunlik reja', '📅 Yillik reja'],
+    ['📊 Statistika'],
   ]).resize();
 }
+
+const MENU_LABELS = ['📋 Kunlik reja', '📅 Yillik reja', '📊 Statistika'];
 
 // ---------- Bugungi reja: boshqaruv ekrani ----------
 
@@ -90,7 +103,7 @@ function planText(dateStr, tasks) {
   if (tasks.length === 0) {
     return `🗓 ${formatDate(dateStr)}\n\nHali vazifa qo'shilmagan.\nQuyidagi "➕ Yangi vazifa qo'shish" tugmasini bosing yoki shunchaki yozib yuboring.`;
   }
-  return `🗓 ${formatDate(dateStr)} kunlik reja\nBajarildi: ${done}/${tasks.length}`;
+  return `🗓 ${formatDate(dateStr)} — kunlik reja\n${progressBar(done, tasks.length)}\nBajarildi: ${done}/${tasks.length}`;
 }
 
 function planManageKeyboard(tasks, { editable = true } = {}) {
@@ -133,23 +146,161 @@ async function showTodayPlan(ctx, { edit = false } = {}) {
   await ctx.reply(text, kb);
 }
 
+// ---------- Yillik reja: boshqaruv ekrani ----------
+
+function yearlyPlanText(year, tasks) {
+  const done = tasks.filter((t) => t.is_done).length;
+  if (tasks.length === 0) {
+    return `📅 ${year}-yil uchun yillik reja\n\nHali maqsad qo'shilmagan.\nQuyidagi "➕ Yangi maqsad qo'shish" tugmasini bosing yoki shunchaki yozib yuboring.`;
+  }
+  return `📅 ${year}-yil — yillik reja\n${progressBar(done, tasks.length)}\nBajarildi: ${done}/${tasks.length}`;
+}
+
+function yearlyManageKeyboard(tasks) {
+  const rows = [];
+  tasks.forEach((t) => {
+    rows.push([
+      Markup.button.callback(`${t.is_done ? '✅' : '⬜'} ${t.text}`, `ytoggle_${t.id}`),
+    ]);
+    rows.push([
+      Markup.button.callback('✏️ Tahrirlash', `yedit_${t.id}`),
+      Markup.button.callback("🗑 O'chirish", `ydelete_${t.id}`),
+    ]);
+  });
+  rows.push([Markup.button.callback("➕ Yangi maqsad qo'shish", 'yadd_task')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function showYearlyPlan(ctx, { edit = false } = {}) {
+  const user = db.getOrCreateUser(ctx.from);
+  const year = currentYear();
+  const plan = db.getOrCreateYearlyPlan(user.id, year);
+  const tasks = db.getYearlyPlanTasks(plan.id);
+  const text = yearlyPlanText(year, tasks);
+  const kb = yearlyManageKeyboard(tasks);
+  if (edit) {
+    try {
+      await ctx.editMessageText(text, kb);
+      return;
+    } catch (e) {
+      // xabarni tahrirlab bo'lmasa, yangisini yuboramiz
+    }
+  }
+  await ctx.reply(text, kb);
+}
+
+// ---------- Statistika / diagrammalar ----------
+
+function statsMenuKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📅 Bugungi kun', 'stats_today')],
+    [Markup.button.callback('🗓 Shu oy (kunlar bo\'yicha)', 'stats_month')],
+    [Markup.button.callback('📆 Shu yil (oylar bo\'yicha)', 'stats_year')],
+    [Markup.button.callback('🎯 Yillik maqsadlar', 'stats_yearly_goals')],
+  ]);
+}
+
+async function renderStats(ctx, text) {
+  try {
+    await ctx.editMessageText(text, statsMenuKeyboard());
+  } catch (e) {
+    await ctx.reply(text, statsMenuKeyboard());
+  }
+}
+
+async function statsToday(ctx) {
+  const user = db.getOrCreateUser(ctx.from);
+  const date = todayStr();
+  const plan = db.getOrCreatePlan(user.id, date);
+  const tasks = db.getPlanTasks(plan.id);
+  const done = tasks.filter((t) => t.is_done).length;
+  const text =
+      `📅 Bugungi kun statistikasi (${formatDate(date)})\n\n` +
+      `${progressBar(done, tasks.length, 16)}\n` +
+      `Bajarildi: ${done}/${tasks.length}`;
+  await renderStats(ctx, text);
+}
+
+async function statsMonth(ctx) {
+  const user = db.getOrCreateUser(ctx.from);
+  const now = new Date();
+  const ym = now.toISOString().slice(0, 7);
+  const rows = db.getDailyStatsForMonth(user.id, ym);
+
+  if (rows.length === 0) {
+    await renderStats(ctx, `🗓 ${MONTH_NAMES_UZ[now.getMonth()]} oyi uchun hali reja kiritilmagan.`);
+    return;
+  }
+
+  let totalTasks = 0;
+  let totalDone = 0;
+  let text = `🗓 ${MONTH_NAMES_UZ[now.getMonth()]} oyi — kunlar bo'yicha\n\n`;
+  rows.forEach((r) => {
+    const day = r.date.slice(8, 10);
+    totalTasks += r.total || 0;
+    totalDone += r.done || 0;
+    text += `${day}-kun: ${progressBar(r.done, r.total, 8)} (${r.done || 0}/${r.total || 0})\n`;
+  });
+  text += `\nOylik jami: ${progressBar(totalDone, totalTasks, 16)}\n${totalDone}/${totalTasks} vazifa bajarildi`;
+  await renderStats(ctx, text);
+}
+
+async function statsYear(ctx) {
+  const user = db.getOrCreateUser(ctx.from);
+  const year = currentYear();
+  const rows = db.getMonthlyStatsForYear(user.id, year);
+
+  if (rows.length === 0) {
+    await renderStats(ctx, `📆 ${year}-yil uchun hali ma'lumot yo'q.`);
+    return;
+  }
+
+  let totalTasks = 0;
+  let totalDone = 0;
+  let text = `📆 ${year}-yil — oylar bo'yicha\n\n`;
+  rows.forEach((r) => {
+    const idx = Number(r.month) - 1;
+    const label = MONTH_NAMES_UZ[idx] ? MONTH_NAMES_UZ[idx].slice(0, 3) : r.month;
+    totalTasks += r.total || 0;
+    totalDone += r.done || 0;
+    text += `${label}: ${progressBar(r.done, r.total, 8)} (${r.done || 0}/${r.total || 0})\n`;
+  });
+  text += `\nYillik jami: ${progressBar(totalDone, totalTasks, 16)}\n${totalDone}/${totalTasks} vazifa bajarildi`;
+  await renderStats(ctx, text);
+}
+
+async function statsYearlyGoals(ctx) {
+  const user = db.getOrCreateUser(ctx.from);
+  const year = currentYear();
+  const plan = db.getOrCreateYearlyPlan(user.id, year);
+  const tasks = db.getYearlyPlanTasks(plan.id);
+  const done = tasks.filter((t) => t.is_done).length;
+  const text =
+      `🎯 ${year}-yil yillik maqsadlar\n\n` +
+      `${progressBar(done, tasks.length, 16)}\n` +
+      `Bajarildi: ${done}/${tasks.length}`;
+  await renderStats(ctx, text);
+}
+
 // ---------- Bot buyruqlari ----------
 
 bot.start(async (ctx) => {
   db.getOrCreateUser(ctx.from);
   await ctx.reply(
       `Assalomu alaykum, ${ctx.from.first_name || "do'stim"}! 👋\n\n` +
-      `Bu bot orqali kunlik rejangizni yozib, bajarganingizni belgilab borishingiz mumkin.\n\n` +
+      `Bu — professional reja boti. U bilan siz:\n\n` +
+      `📋 Kunlik rejangizni yozib, bajarganingizni belgilashingiz;\n` +
+      `📅 Yillik maqsadlaringizni belgilab, kuzatib borishingiz;\n` +
+      `📊 Kunlik, oylik va yillik progressni diagramma ko'rinishida ko'rishingiz mumkin.\n\n` +
       `📌 Qanday ishlaydi:\n` +
       `• Vazifangizni yozib yuboring — har birini alohida qatorga yoki vergul bilan ajratib yozsangiz, har biri alohida vazifa bo'lib qo'shiladi.\n` +
-      `• Har bir vazifani ✅ belgilash, ✏️ tahrirlash yoki 🗑 o'chirish mumkin.\n` +
-      `• Bajarilmagan vazifalaringiz haqida siz belgilagan vaqt oralig'ida eslatma keladi.\n\n` +
+      `• Har bir vazifani ✅ belgilash, ✏️ tahrirlash yoki 🗑 o'chirish mumkin.\n\n` +
       `Pastdagi menyudan foydalaning 👇`,
       mainMenuKeyboard()
   );
 });
 
-bot.hears('📋 Rejalarim', async (ctx) => {
+bot.hears('📋 Kunlik reja', async (ctx) => {
   pendingAction.delete(ctx.from.id);
   await showTodayPlan(ctx);
 });
@@ -159,43 +310,52 @@ bot.command('reja', async (ctx) => {
   await showTodayPlan(ctx);
 });
 
-bot.hears('🔔 Bildirishnoma sozlamalari', async (ctx) => {
-  const user = db.getOrCreateUser(ctx.from);
-  const current = user.reminder_interval_minutes;
-  const rows = REMINDER_OPTIONS.map((o) => [
-    Markup.button.callback(
-        `${o.minutes === current ? '✅ ' : ''}${o.label}`,
-        `rem_${o.minutes}`
-    ),
-  ]);
-  await ctx.reply(
-      `🔔 Bildirishnoma sozlamalari\n\nBajarilmagan vazifalaringiz bo'lsa, tanlangan vaqt oralig'ida sizga eslatma yuboraman.\n\nHozirgi sozlama: ${
-          current > 0 ? current + ' daqiqada bir marta' : "o'chirilgan"
-      }`,
-      Markup.inlineKeyboard(rows)
-  );
+bot.hears('📅 Yillik reja', async (ctx) => {
+  pendingAction.delete(ctx.from.id);
+  await showYearlyPlan(ctx);
 });
 
-// ---------- Callback tugmalar ----------
-
-bot.action(/^rem_(\d+)$/, async (ctx) => {
-  const minutes = Number(ctx.match[1]);
-  const user = db.getOrCreateUser(ctx.from);
-  db.setReminderInterval(user.id, minutes);
-  const rows = REMINDER_OPTIONS.map((o) => [
-    Markup.button.callback(`${o.minutes === minutes ? '✅ ' : ''}${o.label}`, `rem_${o.minutes}`),
-  ]);
-  await ctx.editMessageText(
-      `🔔 Bildirishnoma sozlamalari\n\nHozirgi sozlama: ${
-          minutes > 0 ? minutes + ' daqiqada bir marta' : "o'chirilgan"
-      }`,
-      Markup.inlineKeyboard(rows)
-  );
-  await ctx.answerCbQuery("Saqlandi ✅");
+bot.command('yillik', async (ctx) => {
+  pendingAction.delete(ctx.from.id);
+  await showYearlyPlan(ctx);
 });
+
+bot.hears('📊 Statistika', async (ctx) => {
+  pendingAction.delete(ctx.from.id);
+  await ctx.reply("📊 Qaysi statistikani ko'rmoqchisiz?", statsMenuKeyboard());
+});
+
+bot.command('stat', async (ctx) => {
+  pendingAction.delete(ctx.from.id);
+  await ctx.reply("📊 Qaysi statistikani ko'rmoqchisiz?", statsMenuKeyboard());
+});
+
+// ---------- Statistika callback tugmalari ----------
+
+bot.action('stats_today', async (ctx) => {
+  await statsToday(ctx);
+  await ctx.answerCbQuery();
+});
+
+bot.action('stats_month', async (ctx) => {
+  await statsMonth(ctx);
+  await ctx.answerCbQuery();
+});
+
+bot.action('stats_year', async (ctx) => {
+  await statsYear(ctx);
+  await ctx.answerCbQuery();
+});
+
+bot.action('stats_yearly_goals', async (ctx) => {
+  await statsYearlyGoals(ctx);
+  await ctx.answerCbQuery();
+});
+
+// ---------- Kunlik reja: callback tugmalar ----------
 
 bot.action('add_task', async (ctx) => {
-  pendingAction.set(ctx.from.id, { action: 'add' });
+  pendingAction.set(ctx.from.id, { type: 'daily', action: 'add' });
   await ctx.answerCbQuery();
   await ctx.reply(
       "Yangi vazifa(lar)ni yozing. Bir nechtasini vergul yoki alohida qator bilan ajratib yuborsangiz, har biri alohida vazifa bo'lib qo'shiladi."
@@ -223,7 +383,7 @@ bot.action(/^edit_(\d+)$/, async (ctx) => {
   const user = db.getUserById(plan.user_id);
   if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning vazifangiz emas.');
 
-  pendingAction.set(ctx.from.id, { action: 'edit', taskId });
+  pendingAction.set(ctx.from.id, { type: 'daily', action: 'edit', taskId });
   await ctx.answerCbQuery();
   await ctx.reply(`Vazifa uchun yangi matnni yozing:\n\nEski matn: "${task.text}"`);
 });
@@ -241,7 +401,56 @@ bot.action(/^delete_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery("O'chirildi 🗑");
 });
 
-// ---------- Oldingi rejalar tarixi ----------
+// ---------- Yillik reja: callback tugmalar ----------
+
+bot.action('yadd_task', async (ctx) => {
+  pendingAction.set(ctx.from.id, { type: 'yearly', action: 'add' });
+  await ctx.answerCbQuery();
+  await ctx.reply(
+      "Yangi yillik maqsad(lar)ni yozing. Bir nechtasini vergul yoki alohida qator bilan ajratib yuborsangiz, har biri alohida maqsad bo'lib qo'shiladi."
+  );
+});
+
+bot.action(/^ytoggle_(\d+)$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const task = db.getYearlyTask(taskId);
+  if (!task) return ctx.answerCbQuery('Maqsad topilmadi.');
+  const plan = db.getYearlyPlanById(task.yearly_plan_id);
+  const user = db.getUserById(plan.user_id);
+  if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning maqsadingiz emas.');
+
+  const updated = db.toggleYearlyTask(taskId);
+  await showYearlyPlan(ctx, { edit: true });
+  await ctx.answerCbQuery(updated.is_done ? 'Bajarildi ✅' : 'Bekor qilindi');
+});
+
+bot.action(/^yedit_(\d+)$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const task = db.getYearlyTask(taskId);
+  if (!task) return ctx.answerCbQuery('Maqsad topilmadi.');
+  const plan = db.getYearlyPlanById(task.yearly_plan_id);
+  const user = db.getUserById(plan.user_id);
+  if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning maqsadingiz emas.');
+
+  pendingAction.set(ctx.from.id, { type: 'yearly', action: 'edit', taskId });
+  await ctx.answerCbQuery();
+  await ctx.reply(`Maqsad uchun yangi matnni yozing:\n\nEski matn: "${task.text}"`);
+});
+
+bot.action(/^ydelete_(\d+)$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const task = db.getYearlyTask(taskId);
+  if (!task) return ctx.answerCbQuery('Maqsad topilmadi.');
+  const plan = db.getYearlyPlanById(task.yearly_plan_id);
+  const user = db.getUserById(plan.user_id);
+  if (user.telegram_id !== ctx.from.id) return ctx.answerCbQuery('Bu sizning maqsadingiz emas.');
+
+  db.deleteYearlyTask(taskId);
+  await showYearlyPlan(ctx, { edit: true });
+  await ctx.answerCbQuery("O'chirildi 🗑");
+});
+
+// ---------- Oldingi rejalar tarixi (kunlik) ----------
 
 const HISTORY_PAGE_SIZE = 6;
 
@@ -304,7 +513,7 @@ bot.on('text', async (ctx, next) => {
   const raw = ctx.message.text;
   if (raw.length > 200) {
     return ctx.reply(
-        "❌ Juda uzun matn yubordingiz. Iltimos 1000 ta belgidan kamroq yuboring."
+        "❌ Juda uzun matn yubordingiz. Iltimos 200 ta belgidan kamroq yuboring."
     );
   }
   if (adminBroadcast.get(ctx.from.id)) {
@@ -331,12 +540,37 @@ bot.on('text', async (ctx, next) => {
     );
   }
   if (raw.startsWith('/')) return next();
-  if (raw === '📋 Rejalarim' || raw === '🔔 Bildirishnoma sozlamalari') return next();
+  if (MENU_LABELS.includes(raw)) return next();
 
   const user = db.getOrCreateUser(ctx.from);
   const state = pendingAction.get(ctx.from.id);
 
-  // Tahrirlash rejimida bo'lsa
+  // Yillik reja rejimida bo'lsa
+  if (state && state.type === 'yearly') {
+    if (state.action === 'edit') {
+      const newText = raw.trim();
+      if (!newText) return ctx.reply("Matn bo'sh bo'lmasligi kerak.");
+      db.updateYearlyTaskText(state.taskId, newText);
+      pendingAction.delete(ctx.from.id);
+      await ctx.reply('Maqsad yangilandi ✅');
+      return showYearlyPlan(ctx);
+    }
+
+    // yangi yillik maqsad(lar) qo'shish
+    pendingAction.delete(ctx.from.id);
+    const items = splitIntoTasks(raw);
+    if (items.length === 0) {
+      return ctx.reply('Iltimos, kamida bitta maqsad yozing.');
+    }
+    const year = currentYear();
+    const plan = db.getOrCreateYearlyPlan(user.id, year);
+    items.forEach((text) => db.addYearlyTask(plan.id, text));
+
+    await ctx.reply(`Qo'shildi ✅ (${items.length} ta yangi maqsad)`);
+    return showYearlyPlan(ctx);
+  }
+
+  // Kunlik reja — tahrirlash rejimida bo'lsa
   if (state && state.action === 'edit') {
     const newText = raw.trim();
     if (!newText) return ctx.reply("Matn bo'sh bo'lmasligi kerak.");
@@ -346,7 +580,7 @@ bot.on('text', async (ctx, next) => {
     return showTodayPlan(ctx);
   }
 
-  // Aks holda — yangi vazifa(lar) qo'shish (oddiy yozish yoki "➕" tugmasidan keyin ham shu yerga tushadi)
+  // Aks holda — yangi kunlik vazifa(lar) qo'shish (oddiy yozish yoki "➕" tugmasidan keyin ham shu yerga tushadi)
   pendingAction.delete(ctx.from.id);
   const items = splitIntoTasks(raw);
   if (items.length === 0) {
@@ -409,7 +643,8 @@ async function sendTodayStats(ctx) {
   msg += `Jami foydalanuvchilar: ${totalUsers}\n`;
   msg += `Bugun reja kiritganlar: ${withPlan}\n`;
   msg += `Jami vazifalar: ${totalTasks}\n`;
-  msg += `Bajarilgan vazifalar: ${totalDone}\n\n`;
+  msg += `Bajarilgan vazifalar: ${totalDone}\n`;
+  msg += `${progressBar(totalDone, totalTasks, 16)}\n\n`;
 
   const active = rows.filter((r) => r.total && r.total > 0);
   if (active.length > 0) {
@@ -525,48 +760,6 @@ bot.action(/^admin_userplan_(\d+)_(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// ---------- Har daqiqada tekshiriladigan avtomatik eslatma ----------
-
-cron.schedule('* * * * *', async () => {
-  const date = todayStr();
-  let dueUsers;
-  try {
-    dueUsers = db.getUsersDueForReminder(date);
-  } catch (e) {
-    console.error('Eslatmalarni tekshirishda xato:', e);
-    return;
-  }
-
-  for (const user of dueUsers) {
-    try {
-      const tasks = db.getPlanTasks(user.plan_id);
-      const undone = tasks.filter((t) => !t.is_done);
-      if (undone.length === 0) continue;
-
-      // eski eslatma xabarini o'chirib tashlaymiz (bo'lsa)
-      if (user.last_reminder_chat_id && user.last_reminder_message_id) {
-        try {
-          await bot.telegram.deleteMessage(user.last_reminder_chat_id, user.last_reminder_message_id);
-        } catch (e) {
-          // eski xabar allaqachon o'chirilgan yoki muddati o'tgan bo'lishi mumkin — o'tkazib yuboramiz
-        }
-      }
-
-      let text = `⏰ Eslatma: bugungi rejangizda hali bajarilmagan vazifalar bor:\n\n`;
-      undone.forEach((t) => { text += `⬜ ${t.text}\n`; });
-
-      const sent = await bot.telegram.sendMessage(
-          user.telegram_id,
-          text,
-          planManageKeyboard(tasks, { editable: true })
-      );
-
-      db.setLastReminder(user.id, user.telegram_id, sent.message_id);
-    } catch (e) {
-      console.error(`Foydalanuvchi ${user.telegram_id} ga eslatma yuborishda xato:`, e.message);
-    }
-  }
-});
 bot.action(/^ban_(\d+)$/, async (ctx) => {
 
   if (!isAdmin(ctx)) return;
